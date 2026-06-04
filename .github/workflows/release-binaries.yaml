@@ -48,7 +48,7 @@ jobs:
             cc_pkg: gcc-x86-64-linux-gnu
           - goarch: arm64
             cc: aarch64-linux-gnu-gcc
-            cc_pkg: gcc-aarch64-linux-gnu
+            cc_pkg: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
     steps:
       - name: Resolve tag
         id: tag
