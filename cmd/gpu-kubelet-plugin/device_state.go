@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/pmezard/go-difflib/difflib"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 	cperrors "k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
+	"k8s.io/utils/ptr"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/sirupsen/logrus"
@@ -57,6 +59,7 @@ type DeviceConfigState struct {
 	MpsControlDaemonID string              `json:"mpsControlDaemonID"`
 	Config             configapi.Interface `json:"-"` // don't serialize this.
 	containerEdits     *cdiapi.ContainerEdits
+	TimeSliceApplied   *bool `json:"timeSliceApplied,omitempty"`
 }
 
 type DeviceState struct {
@@ -85,7 +88,8 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	devRoot := containerDriverRoot.getDevRoot()
 	klog.Infof("Using devRoot=%v", devRoot)
 
-	nvdevlib, err := newDeviceLib(containerDriverRoot)
+	hostRoot := root(config.flags.hostRoot)
+	nvdevlib, err := newDeviceLib(containerDriverRoot, hostRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create device library: %w", err)
 	}
@@ -117,7 +121,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	}
 	var vfioCDIHandler *vfioCDIHandler
 	if featuregates.Enabled(featuregates.PassthroughSupport) {
-		vfioCDIHandler, err = NewVfioCDIHandler()
+		vfioCDIHandler, err = NewVfioCDIHandler(nvdevlib)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create vfio CDI handler: %w", err)
 		}
@@ -940,12 +944,18 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 				return fmt.Errorf("error stopping MPS control daemon: %w", err)
 			}
 		}
-
-		// Go back to default time-slicing for all full GPUs.
-		if featuregates.Enabled(featuregates.TimeSlicingSettings) {
-			tsc := configapi.DefaultGpuConfig().Sharing.TimeSlicingConfig
+		// Reset when time-slicing was applied at prepare (true), or when the
+		// checkpoint predates timeSliceApplied (nil — legacy implicit time-slicing).
+		if featuregates.Enabled(featuregates.TimeSlicingSettings) &&
+			ptr.Deref(group.ConfigState.TimeSliceApplied, true) {
+			defaultInterval := configapi.DefaultTimeSlice
+			tsc := &configapi.TimeSlicingConfig{Interval: &defaultInterval}
 			if err := s.tsManager.SetTimeSlice(group.Devices.GpuUUIDs(), tsc); err != nil {
-				return fmt.Errorf("error setting timeslice for devices: %w", err)
+				if err == nvml.ERROR_NOT_SUPPORTED {
+					klog.Warningf("Unprepare: skip resetting time-slice policy for devices: %v", err)
+				} else {
+					return fmt.Errorf("error setting timeslice for devices: %w", err)
+				}
 			}
 		}
 
@@ -1062,6 +1072,7 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 			if err != nil {
 				return nil, fmt.Errorf("error setting timeslice config for requests '%v' in claim '%v': %w", requests, claim.UID, err)
 			}
+			configState.TimeSliceApplied = ptr.To(true)
 		}
 	}
 

@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/urfave/cli/v2"
@@ -53,8 +55,11 @@ type Flags struct {
 	cdiRoot                       string
 	containerDriverRoot           string
 	hostDriverRoot                string
+	hostRoot                      string
 	nvidiaCDIHookPath             string
 	imageName                     string
+	imagePullSecrets              string
+	imagePullPolicy               string
 	kubeletRegistrarDirectoryPath string
 	kubeletPluginsDirectoryPath   string
 	healthcheckPort               int
@@ -63,8 +68,10 @@ type Flags struct {
 }
 
 type Config struct {
-	flags      *Flags
-	clientsets pkgflags.ClientSets
+	flags                *Flags
+	clientsets           pkgflags.ClientSets
+	imagePullSecretNames []string
+	imagePullPolicy      string
 }
 
 func (c Config) DriverPluginPath() string {
@@ -121,6 +128,13 @@ func newApp() *cli.App {
 			EnvVars:     []string{"DRIVER_ROOT_CTR_PATH"},
 		},
 		&cli.StringFlag{
+			Name:        "host-root",
+			Value:       "/host-root",
+			Destination: &flags.hostRoot,
+			EnvVars:     []string{"HOST_ROOT"},
+			Usage:       "the path where the root path of the host file system is mounted in the container (required when PassthroughSupport feature gate is enabled)",
+		},
+		&cli.StringFlag{
 			Name:        "nvidia-cdi-hook-path",
 			Usage:       "Absolute path to the nvidia-cdi-hook executable in the host file system. Used in the generated CDI specification.",
 			Destination: &flags.nvidiaCDIHookPath,
@@ -132,6 +146,18 @@ func newApp() *cli.App {
 			Required:    true,
 			Destination: &flags.imageName,
 			EnvVars:     []string{"IMAGE_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "image-pull-secrets",
+			Usage:       "Comma-separated imagePullSecret names for MPS control daemon Deployments (e.g. regcred,other). Empty string means none.",
+			Destination: &flags.imagePullSecrets,
+			EnvVars:     []string{"IMAGE_PULL_SECRETS"},
+		},
+		&cli.StringFlag{
+			Name:        "image-pull-policy",
+			Usage:       "Image pull policy for MPS control daemon Deployments. Empty string uses the Kubernetes default.",
+			Destination: &flags.imagePullPolicy,
+			EnvVars:     []string{"IMAGE_PULL_POLICY"},
 		},
 		&cli.StringFlag{
 			Name:        "kubelet-registrar-directory-path",
@@ -205,14 +231,20 @@ func newApp() *cli.App {
 				return fmt.Errorf("feature gate validation failed: %w", err)
 			}
 
+			if err := validateCLIFlags(flags); err != nil {
+				return fmt.Errorf("invalid CLI flags: %w", err)
+			}
+
 			clientSets, err := flags.kubeClientConfig.NewClientSets()
 			if err != nil {
 				return fmt.Errorf("create client: %w", err)
 			}
 
 			config := &Config{
-				flags:      flags,
-				clientsets: clientSets,
+				flags:                flags,
+				clientsets:           clientSets,
+				imagePullSecretNames: strings.Fields(strings.ReplaceAll(strings.TrimSpace(flags.imagePullSecrets), ",", " ")),
+				imagePullPolicy:      strings.TrimSpace(flags.imagePullPolicy),
 			}
 
 			return RunPlugin(c.Context, config)
@@ -235,6 +267,27 @@ func newApp() *cli.App {
 	}
 
 	return app
+}
+
+// Input validation of CLI flags.
+func validateCLIFlags(flags *Flags) error {
+	if featuregates.Enabled(featuregates.PassthroughSupport) {
+		if flags.hostRoot == "" {
+			return fmt.Errorf("host root is required when PassthroughSupport feature gate is enabled")
+		}
+		// Host root FS must be mounted in the container for passthrough support to work.
+		// vsekar: This requirement is for being able to run `modprobe` to load the vfio driver.
+		// This mount would also be a duplicate if the nvidia driver is installed to the host rootFS.
+		// TODO: Reduce scope of the host mounts for least access.
+		if _, err := os.Stat(flags.hostRoot); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("host root is not mounted at %q", flags.hostRoot)
+			}
+			return fmt.Errorf("error checking if host root is mounted at %q: %w", flags.hostRoot, err)
+		}
+	}
+
+	return nil
 }
 
 // RunPlugin initializes and runs the GPU kubelet plugin.

@@ -38,7 +38,6 @@ spec:
       labels:
         {{- include "dra-driver-nvidia-gpu.templateLabels" . | nindent 8 }}
         {{- include "dra-driver-nvidia-gpu.selectorLabels" (dict "context" . "componentName" "kubelet-plugin") | nindent 8 }}
-        nvidia-dra-driver-gpu-component: kubelet-plugin
     spec:
       {{- if .Values.kubeletPlugin.priorityClassName }}
       priorityClassName: {{ .Values.kubeletPlugin.priorityClassName }}
@@ -263,6 +262,10 @@ spec:
           value: void
         - name: CDI_ROOT
           value: /var/run/cdi
+        {{- if and .Values.featureGates (and (hasKey .Values.featureGates "PassthroughSupport") .Values.featureGates.PassthroughSupport) }}
+        - name: HOST_ROOT
+          value: "/host-root"
+        {{- end }}
         - name: NVIDIA_MIG_CONFIG_DEVICES
           value: all
         - name: NODE_NAME
@@ -275,6 +278,14 @@ spec:
               fieldPath: metadata.namespace
         - name: IMAGE_NAME
           value: {{ include "dra-driver-nvidia-gpu.fullimage" . }}
+        {{- if .Values.imagePullSecrets }}
+        # Comma-separated secret names (from chart imagePullSecrets) for
+        # dynamically created MPS control daemon Deployment pod specs.
+        - name: IMAGE_PULL_SECRETS
+          value: "{{- range $i, $s := .Values.imagePullSecrets }}{{ if $i }},{{ end }}{{ $s.name }}{{ end }}"
+        {{- end }}
+        - name: IMAGE_PULL_POLICY
+          value: "{{ .Values.image.pullPolicy }}"
         {{- if .Values.nvidiaCDIHookPath }}
         - name: NVIDIA_CDI_HOOK_PATH
           value: "{{ .Values.nvidiaCDIHookPath }}"
@@ -308,6 +319,10 @@ spec:
         {{- if and .Values.featureGates (and (hasKey .Values.featureGates "PassthroughSupport") .Values.featureGates.PassthroughSupport) }}
         - name: host-root
           mountPath: /host-root
+          mountPropagation: HostToContainer
+          readOnly: true
+        - name: lib-modules
+          mountPath: /lib/modules/
           mountPropagation: HostToContainer
           readOnly: true
         - name: sysfs
@@ -352,10 +367,17 @@ spec:
       {{- end }}
       {{- if and .Values.featureGates (and (hasKey .Values.featureGates "PassthroughSupport") .Values.featureGates.PassthroughSupport) }}
       # This is the root filesystem of the host. This is used to execute the required
-      # system commands on the host. For example, to check if a gpu's device node is free.
+      # system commands against the host FS. For example, to test and load the vfio-pci
+      # module variant for a GPU.
       - name: host-root
         hostPath:
           path: /
+          type: Directory
+      # This is needed by `https://github.com/NVIDIA/go-nvlib/pkg/nvpassthrough` pkg
+      # to detect the vfio-pci driver variant to use with a GPU.
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules/
           type: Directory
       - name: sysfs
         hostPath:
